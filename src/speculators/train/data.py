@@ -201,7 +201,7 @@ class Eagle3SampleFileDataset(Dataset):
 
     def __getitem__(self, index) -> BatchType:
         data = torch.load(
-            self.data[index], mmap=True, weights_only=True, map_location="cpu"
+            self.data[index], weights_only=True, map_location="cpu"
         )
 
         data = self.standardize_fn(data)

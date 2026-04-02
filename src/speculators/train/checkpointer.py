@@ -198,7 +198,7 @@ class DistributedCheckpointer(BaseCheckpointer):
     ):
         full_state_dict = torch.load(
             self.optimizer_path(self.previous_epoch),
-            mmap=True,
+            # mmap=False,
             weights_only=True,
             map_location="cpu",
         )

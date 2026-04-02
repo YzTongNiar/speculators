@@ -397,7 +397,25 @@ def load_raw_dataset(
     train_data_path: str, num_proc: int = 8, cache_dir: str | None = None
 ) -> HFDataset:
     """Load raw dataset from local file or HuggingFace."""
-    if train_data_path.endswith((".jsonl", ".json")):
+    # if train_data_path.endswith((".jsonl", ".json")):
+    #     # import glob
+    #     # train_data_path = glob.glob("/mnt/share/w00664509/full_20w_ali_data/*.json")
+    #     return load_dataset(
+    #         "json", data_files=train_data_path, split="train", cache_dir=cache_dir
+    #     )
+    if train_data_path == 'sharegpt':
+        import glob
+        train_data_path = glob.glob("/mnt/share/l00606955/datasets/sharegpt-gen/*.json")
+        return load_dataset(
+            "json", data_files=train_data_path, split="train", cache_dir=cache_dir
+        )
+    elif train_data_path == 'ultrachat':
+        import glob
+        train_data_path_1 = glob.glob("/mnt/share/l00606955/datasets/ultrachat-gen/32b-sft-00-temprature0/*.json")
+        train_data_path_2 = glob.glob("/mnt/share/l00606955/datasets/ultrachat-gen/32b-sft-01-temprature0/*.json")
+        train_data_path_3 = glob.glob("/mnt/share/l00606955/datasets/ultrachat-gen/32b-sft-02-temprature0/*.json")
+        train_data_path = train_data_path_1 + train_data_path_2 + train_data_path_3
+        print(f'************** {train_data_path} ***************')
         return load_dataset(
             "json", data_files=train_data_path, split="train", cache_dir=cache_dir
         )
@@ -468,7 +486,7 @@ def load_and_preprocess_dataset(
     raw_dataset = load_raw_dataset(
         train_data_path, num_proc=build_dataset_num_proc, cache_dir=cache_dir
     )
-    raw_dataset = raw_dataset.shuffle(seed=seed)
+    # raw_dataset = raw_dataset.shuffle(seed=seed)
 
     if max_samples is not None and len(raw_dataset) > max_samples:
         raw_dataset = raw_dataset.select(range(max_samples))

@@ -27,6 +27,7 @@ from speculators.train.utils import maybe_destroy_distributed, maybe_setup_distr
 DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "llama": LlamaConfig,
     "qwen3": Qwen3Config,
+    "vwn_llama":LlamaConfig
 }
 
 
@@ -248,8 +249,39 @@ def parse_args():
     parser.add_argument(
         "--speculator-type",
         type=str,
-        default="eagle3",
-        help="Type of speculator model to train (e.g., eagle3)",
+        default="vwn_eagle3",
+        help="Type of speculator model to train (e.g., eagle3, vwn_eagle3)",
+    )
+    parser.add_argument(
+        "--vwn-m",
+        type=int,
+        default=2,
+        help=(
+            "VWN partition count for original hidden vector. "
+            "Must divide hidden_size evenly. "
+            "Ablation: set --vwn-m 1 --vwn-r 1.0 to disable width expansion."
+        ),
+    )
+    parser.add_argument(
+        "--vwn-r",
+        type=float,
+        default=1.5,
+        help=(
+            "VWN expansion ratio: D' = r * D. "
+            "Must satisfy r * m = integer. "
+            "Recommended: 1.5 (m=2) or 8.0 (m=8)."
+        ),
+    )
+    parser.add_argument(
+        "--pre-vwn-version",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "Version of pre_vwn_layer to use. "
+            "0: VwnEagle3PreVwnLayer (default, full fusion). "
+            "1: VwnEagle3PreVwnLayerV1 (ablation, simplified fusion)."
+        ),
     )
     parser.add_argument("--data-path", type=str, default="./data")
     parser.add_argument("--save-path", type=str, default="./checkpoints")
@@ -269,10 +301,11 @@ def parse_args():
     parser.add_argument(
         "--draft-arch",
         type=str,
-        default="llama",
+        default="vwn_llama",
         choices=list(DRAFT_ARCH_CONFIGS.keys()),
         help="Architecture for draft decoder layers. Defaults to 'llama'. "
-        "Note: only 'llama' is currently supported in vLLM for inference.",
+        "Note: only 'llama' is currently supported in vLLM for inference."
+        "vwn_llama is also supported",
     )
     parser.add_argument("--d2t-path", type=str, default=None)
     parser.add_argument("--t2d-path", type=str, default=None)

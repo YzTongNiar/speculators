@@ -326,7 +326,9 @@ def generate_and_save_hidden_states(args, dataset):
 
 def main():
     args = parse_args()
-
+    # args.train_data_path = '/mnt/share/t00886357/eagle3/dataset/sharegpt/debug.json'
+        # '/mnt/share/t00886357/eagle3/dataset/gsm8k/regenerated/regenerated_0_to_7472.jsonl',
+    args.assistant_pattern = r"<\|im_start\|>assistant\n((?:(?!<\|im_start\|>).)*?)<\|im_end\|>"
     log.section("EAGLE Offline Data Generation")
     log.config(
         {

@@ -1,5 +1,5 @@
 from typing import Any, Literal
-
+from dataclasses import dataclass
 from pydantic import Field, field_serializer, field_validator
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
@@ -8,6 +8,8 @@ from speculators import SpeculatorModelConfig
 
 __all__ = [
     "Eagle3SpeculatorConfig",
+    "VwnConfig",
+    "VwnEagle3SpeculatorConfig"
 ]
 
 
@@ -82,3 +84,98 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
                 ).__class__
             return config_class(**value)
         return value
+# ──────────────────────────────────────────────────────────────────────────────
+# VwnConfig: VWN 参数容器 + 约束校验
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class VwnConfig:
+    """VWN 宽度扩展参数。
+
+    约束（来自设计文档）：
+        D' = r * D
+        r  = n / m   →  r * m 必须为整数
+        m  能整除 D
+        n  能整除 D'
+    """
+
+    m: int = 2
+    r: float = 1.5
+
+    def __post_init__(self):
+        n_float = self.r * self.m
+        if abs(n_float - round(n_float)) > 1e-6:
+            raise ValueError(
+                f"r * m 必须为整数，当前 r={self.r}, m={self.m}, r*m={n_float}。"
+                "请选择满足条件的 r 和 m。"
+            )
+        self.n: int = round(n_float)
+
+    def expanded_hidden_size(self, hidden_size: int) -> int:
+        """返回 D' = r * D，同时校验整除约束。"""
+        if hidden_size % self.m != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) 必须能被 m ({self.m}) 整除。"
+            )
+        d_prime = round(self.r * hidden_size)
+        if d_prime % self.n != 0:
+            raise ValueError(
+                f"扩维后 D'={d_prime} 必须能被 n={self.n} 整除。"
+            )
+        return d_prime
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VwnEagle3SpeculatorConfig
+# ──────────────────────────────────────────────────────────────────────────────
+@SpeculatorModelConfig.register("vwn_eagle3")  
+class VwnEagle3SpeculatorConfig(Eagle3SpeculatorConfig):
+    """VWN+Eagle3 草稿模型配置。
+
+    在 Eagle3SpeculatorConfig 基础上增加两个 VWN 参数：
+        vwn_m: 原始 hidden vector 的等分份数（对应设计文档中的 m）
+        vwn_r: 扩维系数，D' = r * D（对应设计文档中的 r）
+
+    其余参数（transformer_layer_config、draft_vocab_size、
+    norm_before_residual、embed_requires_grad 等）原样继承。
+    """
+
+    # 覆盖父类的 speculators_model_type
+    speculators_model_type: Literal["vwn_eagle3"] = "vwn_eagle3"  # type: ignore[assignment]
+
+    # ── 新增字段 ──────────────────────────────────────────────────────────────
+    vwn_m: int = Field(
+        default=2,
+        description="VWN 原始 hidden vector 的等分份数，必须能整除 hidden_size。",
+    )
+    vwn_r: float = Field(
+        default=1.5,
+        description="VWN 扩维系数：D' = r * D，要求 r * m 为整数。",
+    )
+    pre_vwn_version: int = Field(
+        default=0,
+        description="pre_vwn_layer 版本：0=完整融合(v0)，1=简化消融(v1)。",
+    )
+    vwn_draft_arch: str = Field(
+        default="vwn_llama",
+        description="VWN model_classes 的查表 key，值为 vwn_llama 或 vwn_qwen3。",
+    )
+    
+    @property
+    def vwn(self) -> VwnConfig:
+        """返回经过校验的 VwnConfig 实例。"""
+        return VwnConfig(m=self.vwn_m, r=self.vwn_r)
+    
+    @property
+    def pre_vwn_layer_class(self) -> type:
+        from .model_definitions import VwnEagle3PreVwnLayer, VwnEagle3PreVwnLayerV1
+        """根据 pre_vwn_version 返回对应的 pre_vwn_layer 类。"""
+        if self.pre_vwn_version == 0:
+            return VwnEagle3PreVwnLayer
+        elif self.pre_vwn_version == 1:
+            return VwnEagle3PreVwnLayerV1
+        else:
+            raise ValueError(
+                f"未知的 pre_vwn_version: {self.pre_vwn_version}，"
+                "目前支持 0（完整融合）和 1（简化消融）。"
+            )
