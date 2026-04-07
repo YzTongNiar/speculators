@@ -312,6 +312,29 @@ def parse_args():
     parser.add_argument("--ttt-steps", type=int, default=3)
     parser.add_argument("--ttt-step-loss-decay", type=float, default=1.0)
     parser.add_argument(
+        "--loss-type",
+        type=str,
+        default="kl",
+        choices=["kl", "lk_log_acceptance", "lk_hybrid"],
+        help=(
+            "Training loss objective. "
+            "'kl': standard forward KL divergence (default). "
+            "'lk_log_acceptance': negative log acceptance rate -log(sum_x min(p,q)). "
+            "'lk_hybrid': adaptive mixture lambda*KL + (1-lambda)*TV, "
+            "lambda=exp(-eta*alpha) (LK Losses, Samarin et al. 2026)."
+        ),
+    )
+    parser.add_argument(
+        "--eta",
+        type=float,
+        default=3.0,
+        help=(
+            "Decay rate for the adaptive lambda schedule used by 'lk_hybrid'. "
+            "Higher values shift from KL to TV faster as acceptance rate improves. "
+            "Typical range: 1–10. Default: 3.0."
+        ),
+    )
+    parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
     parser.add_argument(

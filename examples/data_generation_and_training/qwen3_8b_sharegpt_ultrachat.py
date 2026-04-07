@@ -60,12 +60,16 @@ if __name__ == "__main__":
     )
 
     # Training
+    # loss_type: "kl" (default), "lk_log_acceptance", or "lk_hybrid"
+    # eta: adaptive schedule decay rate for "lk_hybrid" (default 3.0)
     train_args = TrainArgs(
         logger="trackio",
         lr=3e-5,
         total_seq_len=TOTAL_SEQ_LEN,
         run_name="qwen3_8b_sharegpt_ultrachat",
         epochs=10,
+        loss_type="lk_hybrid",
+        eta=3.0,
     )
 
     run_e2e(

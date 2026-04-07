@@ -86,22 +86,101 @@ def loss_function(
     logits: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
     loss_mask: torch.Tensor | None,  # shape: [1, total_seq_len - ttt_step]
-):
+    loss_type: str = "kl",
+    eta: float = 3.0,
+) -> tuple[torch.Tensor, dict]:
+    """Compute the training loss.
+
+    Args:
+        logits: Draft model logits (pre-softmax).
+        targets: Target model logits (pre-softmax).
+        loss_mask: Boolean mask over sequence positions.
+        loss_type: One of "kl", "lk_log_acceptance", or "lk_hybrid".
+            - "kl": Standard forward KL divergence KL(p||q).
+            - "lk_log_acceptance": Negative log acceptance rate -log(alpha),
+              where alpha = sum_x min(p(x), q(x)).  Eq. (L_LK^alpha) from the
+              LK Losses paper (Samarin et al., 2026).
+            - "lk_hybrid": Adaptive mixture lambda*KL + (1-lambda)*TV, with
+              lambda = exp(-eta * sg[alpha]).  Eq. (L_LK^lambda) from the paper.
+        eta: Decay rate for the adaptive lambda schedule (lk_hybrid only).
+
+    Returns:
+        Tuple of (scalar loss, extras dict). The extras dict contains:
+            - "alpha": mean acceptance rate (lk_log_acceptance, lk_hybrid only)
+            - "lambda": blending weight (lk_hybrid only)
+    """
     # Note: logits, targets, and loss_mask are already aligned for the current ttt_step
-    logits = torch.nn.functional.log_softmax(logits, dim=-1)
+    log_q = torch.nn.functional.log_softmax(logits, dim=-1)
     target_p = torch.nn.functional.softmax(targets, dim=-1)
-    elementwise_loss = torch.nn.functional.kl_div(
-        logits, target_p, reduction="none", log_target=False
-    )
 
     if loss_mask is not None:
-        elementwise_loss = elementwise_loss * loss_mask.unsqueeze(-1)
         denominator: torch.Tensor | int = loss_mask.sum(dim=1) + 1e-5
     else:
         denominator = logits.shape[1]  # total_seq_len - ttt_step
-    batch_loss = torch.sum(elementwise_loss, dim=(1, 2)) / denominator
+
+    extras: dict = {}
+
+    if loss_type == "kl":
+        elementwise_loss = torch.nn.functional.kl_div(
+            log_q, target_p, reduction="none", log_target=False
+        )
+        if loss_mask is not None:
+            elementwise_loss = elementwise_loss * loss_mask.unsqueeze(-1)
+        batch_loss = torch.sum(elementwise_loss, dim=(1, 2)) / denominator
+
+    elif loss_type == "lk_log_acceptance":
+        # L_LK^alpha = -log(alpha), alpha = sum_x min(p(x), q(x))
+        # Gradient: (1/alpha) * grad(TV), which rescales TV gradient by 1/alpha,
+        # restoring O(1/sqrt(k)) magnitude matching KL at initialisation.
+        q = log_q.exp()
+        alpha = torch.sum(torch.minimum(target_p, q), dim=-1)
+        # shape: [1, total_seq_len - ttt_step]
+        elementwise_loss = -torch.log(alpha + 1e-10)
+        # shape: [1, total_seq_len - ttt_step]
+        if loss_mask is not None:
+            elementwise_loss = elementwise_loss * loss_mask
+        batch_loss = torch.sum(elementwise_loss, dim=1) / denominator
+        with torch.no_grad():
+            if loss_mask is not None:
+                extras["alpha"] = (alpha * loss_mask).sum() / (loss_mask.sum() + 1e-5)
+            else:
+                extras["alpha"] = alpha.mean()
+
+    elif loss_type == "lk_hybrid":
+        # L_LK^lambda = lambda * KL(p||q) + (1 - lambda) * TV(p, q)
+        # lambda = exp(-eta * sg[alpha]), computed per draft-head position
+        # (aggregated across batch and sequence dimensions).
+        q = log_q.exp()
+        with torch.no_grad():
+            alpha = torch.sum(torch.minimum(target_p, q), dim=-1)
+            # shape: [1, total_seq_len - ttt_step]
+            if loss_mask is not None:
+                alpha_mean = (alpha * loss_mask).sum() / (loss_mask.sum() + 1e-5)
+            else:
+                alpha_mean = alpha.mean()
+            lambda_w = torch.exp(-eta * alpha_mean)
+            extras["alpha"] = alpha_mean
+            extras["lambda"] = lambda_w
+
+        kl_per_pos = torch.sum(
+            torch.nn.functional.kl_div(log_q, target_p, reduction="none", log_target=False),
+            dim=-1,
+        )  # shape: [1, total_seq_len - ttt_step]
+        tv_per_pos = 0.5 * torch.sum(torch.abs(target_p - q), dim=-1)
+        # shape: [1, total_seq_len - ttt_step]
+        elementwise_loss = lambda_w * kl_per_pos + (1 - lambda_w) * tv_per_pos
+        if loss_mask is not None:
+            elementwise_loss = elementwise_loss * loss_mask
+        batch_loss = torch.sum(elementwise_loss, dim=1) / denominator
+
+    else:
+        raise ValueError(
+            f"Unknown loss_type: '{loss_type}'. "
+            "Choose from 'kl', 'lk_log_acceptance', 'lk_hybrid'."
+        )
+
     # shape: [1]
-    return batch_loss.mean()
+    return batch_loss.mean(), extras
 
 
 def compute_metrics(
@@ -111,6 +190,8 @@ def compute_metrics(
     prev_correct: torch.Tensor | None,
     ttt_step: int,
     ttt_step_loss_decay: float,
+    loss_type: str = "kl",
+    eta: float = 3.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute metrics for a given ttt_step.
 
@@ -121,6 +202,8 @@ def compute_metrics(
         prev_correct: The previous correct predictions for the current ttt_step.
         ttt_step: The current ttt_step.
         ttt_step_loss_decay: The loss decay for the current ttt_step.
+        loss_type: Loss variant — "kl", "lk_log_acceptance", or "lk_hybrid".
+        eta: Decay rate for the adaptive lambda schedule (lk_hybrid only).
 
     Effects:
         Modifies prev_correct in place.
@@ -134,7 +217,8 @@ def compute_metrics(
         logits, targets, loss_mask, prev_correct, ttt_step
     )
     loss_weight = ttt_step_loss_decay**ttt_step
-    s_loss = loss_weight * loss_function(s_logits, s_targets, s_loss_mask)
+    raw_loss, extras = loss_function(s_logits, s_targets, s_loss_mask, loss_type, eta)
+    s_loss = loss_weight * raw_loss
 
     s_full_acc, s_cond_acc = compute_accuracy(
         s_logits, s_targets, s_loss_mask, s_prev_correct
@@ -142,6 +226,8 @@ def compute_metrics(
     s_metrics[f"loss_{ttt_step}"] = s_loss.detach().clone()
     s_metrics[f"full_acc_{ttt_step}"] = s_full_acc
     s_metrics[f"cond_acc_{ttt_step}"] = s_cond_acc
+    for key, value in extras.items():
+        s_metrics[f"{key}_{ttt_step}"] = value.detach().clone() if isinstance(value, torch.Tensor) else value
 
     return s_loss, s_metrics
 
@@ -367,6 +453,8 @@ class Eagle3DraftModel(SpeculatorModel):
         ttt_steps: int = 3,
         ttt_step_loss_decay: float = 1.0,
         use_off_policy_tokens: bool = False,
+        loss_type: str = "kl",
+        eta: float = 3.0,
         **kwargs,
     ):
         device = hidden_states.device
@@ -457,6 +545,8 @@ class Eagle3DraftModel(SpeculatorModel):
                     prev_correct,
                     ttt_step,
                     ttt_step_loss_decay,
+                    loss_type,
+                    eta,
                 )
                 loss += s_loss
                 metrics.update(s_metrics)
@@ -551,11 +641,15 @@ class Eagle3DraftModel(SpeculatorModel):
             "use_off_policy_tokens": kwargs["use_off_policy_tokens"],
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "loss_type": kwargs.get("loss_type", "kl"),
+            "eta": kwargs.get("eta", 3.0),
         }
         val_kwargs = {
             "use_off_policy_tokens": False,
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "loss_type": kwargs.get("loss_type", "kl"),
+            "eta": kwargs.get("eta", 3.0),
         }
         return train_kwargs, val_kwargs
 
@@ -794,9 +888,11 @@ class VwnEagle3DraftModel(SpeculatorModel):
         ttt_steps: int = 3,
         ttt_step_loss_decay: float = 1.0,
         use_off_policy_tokens: bool = False,
+        loss_type: str = "kl",
+        eta: float = 3.0,
         **kwargs,
     ):
-        
+
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
 
@@ -897,6 +993,8 @@ class VwnEagle3DraftModel(SpeculatorModel):
                     prev_correct,
                     ttt_step,
                     ttt_step_loss_decay,
+                    loss_type,
+                    eta,
                 )
                 loss += s_loss
                 metrics.update(s_metrics)
@@ -966,10 +1064,14 @@ class VwnEagle3DraftModel(SpeculatorModel):
             "use_off_policy_tokens": kwargs["use_off_policy_tokens"],
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "loss_type": kwargs.get("loss_type", "kl"),
+            "eta": kwargs.get("eta", 3.0),
         }
         val_kwargs = {
             "use_off_policy_tokens": False,
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "loss_type": kwargs.get("loss_type", "kl"),
+            "eta": kwargs.get("eta", 3.0),
         }
         return train_kwargs, val_kwargs

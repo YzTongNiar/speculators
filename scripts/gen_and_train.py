@@ -132,6 +132,8 @@ class TrainArgs(NamedTuple):
     scheduler_warmup_steps: int | _NS = _NOTSET
     scheduler_total_steps: int | _NS = _NOTSET
     scheduler_num_cosine_cycles: float | _NS = _NOTSET
+    loss_type: str | _NS = _NOTSET
+    eta: float | _NS = _NOTSET
 
 
 ### END OF SCRIPT ARGUMENTS ###
