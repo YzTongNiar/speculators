@@ -118,7 +118,7 @@ def test_detect_assistant_pattern_correctly_identifies_assistant_vs_user():
         {"role": "user", "content": "USER_MSG"},
         {"role": "assistant", "content": "ASSISTANT_MSG"},
     ]
-    formatted = tokenizer.apply_chat_template(
+    formatted: str = tokenizer.apply_chat_template(  # type: ignore[assignment]
         test_conv, tokenize=False, add_generation_prompt=False
     )
 
@@ -156,7 +156,7 @@ def test_detect_assistant_pattern_extracts_correct_content():
         {"role": "assistant", "content": "Second answer"},
     ]
 
-    formatted = tokenizer.apply_chat_template(
+    formatted: str = tokenizer.apply_chat_template(  # type: ignore [assignment]
         test_conv, tokenize=False, add_generation_prompt=False
     )
 
@@ -214,7 +214,7 @@ def test_create_loss_mask_simple():
     mask = _create_loss_mask_from_offsets(text, offsets, pattern)
 
     assert len(mask) == len(offsets)
-    assert mask.dtype == torch.long
+    assert mask.dtype == torch.bool
 
     # Tokens in assistant responses should have mask = 1
     # "Hi there!" is at positions 6-8 (indices in offsets)
@@ -443,7 +443,7 @@ def test_preprocess_batch_falls_back_to_regex():
             raise ValueError("Forcing fallback to regex path")
         return original_apply_chat_template(*args, **kwargs)
 
-    tokenizer.apply_chat_template = patched_apply_chat_template
+    tokenizer.apply_chat_template = patched_apply_chat_template  # type: ignore [method-assign]
 
     examples = {
         "conversations": [
@@ -610,6 +610,122 @@ def test_preprocess_batch_with_turn_dropout():
 
 
 # Tests for custom assistant pattern feature
+
+
+@pytest.mark.sanity
+def test_detect_assistant_pattern_thinking_model():
+    """Test pattern detection with a real thinking model (Qwen3).
+
+    Thinking templates wrap assistant content in <think>...</think> tags.
+    The detection uses simple test messages that produce empty think blocks,
+    but the pattern must still match real conversations where the think block
+    contains substantial content.
+    """
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", trust_remote_code=True)
+    pattern = _detect_assistant_pattern(tokenizer)
+
+    # Format a multi-turn conversation with thinking content injected
+    # directly into the formatted string (as it would appear in real data)
+    test_conv = [
+        {"role": "user", "content": "What is 2+2?"},
+        {
+            "role": "assistant",
+            "content": "The answer is 4.",
+            "reasoning_content": "We are adding 2 and 2.",
+        },
+        {"role": "user", "content": "What is 3+3?"},
+        {
+            "role": "assistant",
+            "content": "The answer is 6.",
+            "reasoning_content": "We are adding 3 and 3.",
+        },
+    ]
+    formatted: str = tokenizer.apply_chat_template(  # type: ignore[assignment]
+        test_conv, tokenize=False, add_generation_prompt=False, enable_thinking=True
+    )
+
+    matches = list(re.finditer(pattern, formatted, re.DOTALL))
+    assert len(matches) == 2, (
+        f"Expected 2 matches, got {len(matches)}.\n"
+        f"Pattern: {pattern}\nText: {formatted}"
+    )
+
+    # Each match should capture its own assistant content, not the other's
+    assert "answer is 4" in matches[0].group(1)
+    assert "answer is 6" not in matches[0].group(1)
+    assert "answer is 6" in matches[1].group(1)
+
+    # Neither match should contain user content
+    for m in matches:
+        assert "What is" not in m.group(1)
+
+    # Reasoning content should be stripped from context turns
+    assert "2 and 2" not in matches[0].group(1)
+
+    # Reasoning content should be present in the final turn
+    assert "3 and 3" in matches[1].group(1)
+
+
+@pytest.mark.sanity
+@pytest.mark.parametrize(
+    "thinking_content",
+    [
+        "",
+        "Let me think step by step.\nThe user asked about France.",
+    ],
+    ids=["no_thinking", "with_thinking"],
+)
+def test_create_loss_mask_thinking_model(thinking_content):
+    """Test _create_loss_mask_from_offsets with Qwen3's thinking template.
+
+    Verifies correct masking both with and without thinking content in the
+    <think> block.
+    """
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", trust_remote_code=True)
+    pattern = _detect_assistant_pattern(tokenizer)
+
+    # Build formatted text using the real chat template
+    conv = [
+        {"role": "user", "content": "What is the capital of France?"},
+        {"role": "assistant", "content": "Paris is the capital."},
+    ]
+    if thinking_content:
+        conv[-1]["reasoning_content"] = thinking_content
+    formatted: str = tokenizer.apply_chat_template(  # type: ignore[assignment]
+        conv,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=bool(thinking_content),
+    )
+
+    # Tokenize with offsets
+    encoding = tokenizer(
+        formatted,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    offsets = encoding["offset_mapping"]
+
+    mask = _create_loss_mask_from_offsets(formatted, offsets, pattern)
+
+    assert len(mask) == len(offsets)
+    assert mask.sum() > 0, "Loss mask should not be all zeros"
+
+    # Decode masked vs unmasked regions
+    input_ids = torch.tensor(encoding["input_ids"])
+    trainable_text = tokenizer.decode(input_ids[mask == 1])
+    masked_text = tokenizer.decode(input_ids[mask == 0])
+
+    # Assistant response must be in the trainable region
+    assert "Paris is the capital" in trainable_text
+
+    # User message must NOT be in the trainable region
+    assert "What is the capital of France" not in trainable_text
+    assert "What is the capital of France" in masked_text
+
+    # Thinking content should be in the trainable region (part of assistant turn)
+    if thinking_content:
+        assert "step by step" in trainable_text
 
 
 @pytest.mark.sanity

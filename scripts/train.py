@@ -1,6 +1,8 @@
 import argparse
+import logging
 import random
 import warnings
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -11,10 +13,11 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from speculators.model import SpeculatorModel
 from speculators.train.data import (
+    BaseEagle3Dataset,
+    Eagle3ArrowDataset,
     Eagle3SampleFileDataset,
     create_collate_fn,
     split_files,
-    standardize_data_v1,
 )
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
@@ -23,6 +26,12 @@ from speculators.train.logger import setup_metric_logger, setup_root_logger
 from speculators.train.noise_transforms import AddUniformNoise
 from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import maybe_destroy_distributed, maybe_setup_distributed
+from speculators.train.vocab_mapping import (
+    build_vocab_mappings_from_distribution,
+    get_target_vocab_size,
+)
+
+logger = logging.getLogger(__name__)
 
 DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "llama": LlamaConfig,
@@ -45,11 +54,10 @@ def set_seed(seed: int, deterministic: bool = False):
 
 
 def setup_dataloader(
-    file_list: list[str],
+    dataset: BaseEagle3Dataset,
     world_size: int,
-    local_rank: int,
-    add_noise: bool = True,
-    noise_std: float = 0.05,
+    rank: int,
+    hidden_size: int,
     num_workers: int = 12,
     prefetch_factor: int = 4,
 ) -> DataLoader:
@@ -57,7 +65,7 @@ def setup_dataloader(
     Args:
         file_list: List of file paths to load data from.
         world_size: Number of processes in the distributed training.
-        local_rank: Rank of the current process.
+        rank: Global rank of the current process.
         add_noise: Whether to add noise to the data.
         noise_std: Standard deviation for noise augmentation.
         num_workers: Number of dataloader workers.
@@ -65,26 +73,11 @@ def setup_dataloader(
     Returns:
         DataLoader: Dataloader for training.
     """
-    if add_noise:
-        noise_transform = AddUniformNoise(
-            std=noise_std, tensors=("hidden_states", "verifier_last_hidden_states")
-        )
-    else:
-        noise_transform = None
-
-    standardize_fn = standardize_data_v1
-
-    dataset = Eagle3SampleFileDataset(
-        file_list=file_list,
-        max_len=args.total_seq_len,
-        transform=noise_transform,
-        standardize_fn=standardize_fn,
-    )
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=args.total_seq_len,
         lengths=dataset.approx_lengths,
         num_replicas=world_size,
-        rank=local_rank,
+        rank=rank,
     )
     return DataLoader(
         dataset,
@@ -92,7 +85,7 @@ def setup_dataloader(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         pin_memory=True,
-        collate_fn=create_collate_fn(args.total_seq_len),
+        collate_fn=create_collate_fn(args.total_seq_len, hidden_size),
         persistent_workers=True,
     )
 
@@ -121,7 +114,7 @@ def create_transformer_layer_config(
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
-    transformer_layer_config = config_class(
+    return config_class(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
         intermediate_size=verifier_config.intermediate_size,
@@ -133,9 +126,80 @@ def create_transformer_layer_config(
         initializer_range=verifier_config.initializer_range,
         rms_norm_eps=verifier_config.rms_norm_eps,
         head_dim=getattr(verifier_config, "head_dim", None),
+        tie_word_embeddings=False,
     )
-    transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
-    return transformer_layer_config
+
+
+def _load_mappings(d2t_path, t2d_path, expected_draft_vocab_size: int | None):
+    logger.info(f"Loading vocab mappings from '{d2t_path}' and '{t2d_path}'")
+    # Load d2t and t2d tensors if provided
+    d2t = torch.from_numpy(np.load(d2t_path))
+    t2d = torch.from_numpy(np.load(t2d_path))
+    draft_vocab_size = d2t.shape[0]
+    if expected_draft_vocab_size and expected_draft_vocab_size != draft_vocab_size:
+        raise ValueError(
+            f"Explicit vocab mapping (t2d & d2t) files were provided, but don't"
+            f"match the provided --draft-vocab-size {draft_vocab_size}."
+            f"d2t.shape={d2t.shape}, dim 0 should match provided value."
+        )
+    return d2t, t2d, draft_vocab_size
+
+
+def parse_vocab_mappings(args: argparse.Namespace):
+    if args.d2t_path or args.t2d_path:
+        if not (args.d2t_path and args.t2d_path):
+            raise ValueError(
+                "Both t2d and d2t must be provided together, or both must be omitted. "
+                f"Got t2d={'provided' if args.t2d_path is not None else 'not provided'}"
+                f"d2t={'provided' if args.d2t_path is not None else 'not provided'}"
+            )
+
+        return _load_mappings(args.d2t_path, args.t2d_path, args.draft_vocab_size)
+
+    data_path = Path(args.data_path)
+    default_t2d_path = data_path / "t2d.npy"
+    default_d2t_path = data_path / "d2t.npy"
+
+    if default_t2d_path.exists() and default_d2t_path.exists():
+        return _load_mappings(default_d2t_path, default_t2d_path, args.draft_vocab_size)
+
+    token_freq_path = args.token_freq_path or data_path / "token_freq.pt"
+    token_freq_path = Path(token_freq_path)
+    if token_freq_path.exists() and args.draft_vocab_size is not None:
+        logger.info("No vocab mappings provided. Regenerating from token frequencies")
+        token_freq_dict = torch.load(token_freq_path, weights_only=True)
+
+        target_vocab_size = get_target_vocab_size(None, args.verifier_name_or_path)
+
+        d2t, t2d = build_vocab_mappings_from_distribution(
+            token_freq_dict=token_freq_dict,
+            draft_vocab_size=args.draft_vocab_size,
+            target_vocab_size=target_vocab_size,
+        )
+        draft_vocab_size = d2t.shape[0]
+        if args.draft_vocab_size and args.draft_vocab_size != draft_vocab_size:
+            raise ValueError(
+                f"Explicit vocab mapping (t2d & d2t) files were provided, but don't"
+                f"match the provided --draft-vocab-size {draft_vocab_size}."
+                f"d2t.shape={d2t.shape}, dim 0 should match provided value."
+            )
+
+        logger.info(f"Caching vocab mapping files to '{data_path}'")
+        np.save(data_path / "d2t.npy", d2t.cpu().numpy())
+        np.save(data_path / "t2d.npy", t2d.cpu().numpy())
+
+        return d2t, t2d, draft_vocab_size
+
+    logger.warning(
+        "No vocab mappings found, and can't generate new ones because either "
+        f"token_freq_path='{token_freq_path}' doesn't exist or --draft-vocab-size is "
+        "None. Using full verifier vocab"
+    )
+    # When vocab mapping is not provided, use the full verifier vocab
+    verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
+    if hasattr(verifier_config, "text_config"):
+        verifier_config = verifier_config.text_config
+    return None, None, verifier_config.vocab_size
 
 
 def main(args: argparse.Namespace):
@@ -150,36 +214,19 @@ def main(args: argparse.Namespace):
 
     # Setup distributed training
     local_rank, world_size, rank, is_distributed = maybe_setup_distributed()
-    device = torch.device(local_rank)
+    logger.info(f"Using RANK: {rank}, LOCAL_RANK: {local_rank}, WORLD_SIZE: {world_size}")
+    if not hasattr(torch, args.hidden_states_dtype):
+        raise ValueError(
+            "--hidden-states-dtype must be a dtype attribute of torch. e.g. `bfloat16`"
+        )
+    hidden_states_dtype = getattr(torch, args.hidden_states_dtype)
 
-    # Load t2d and d2t tensors if provided
-    if args.d2t_path or args.t2d_path:
-        if not (args.d2t_path and args.t2d_path):
-            raise ValueError(
-                "Both t2d and d2t must be provided together, or both must be omitted. "
-                f"Got t2d={'provided' if args.t2d_path is not None else 'not provided'}"
-                f"d2t={'provided' if args.d2t_path is not None else 'not provided'}"
-            )
-        d2t = torch.from_numpy(np.load(args.d2t_path)).to(device)
-        t2d = torch.from_numpy(np.load(args.t2d_path)).to(device)
-        draft_vocab_size = d2t.shape[0]
-    else:
-        d2t = None
-        t2d = None
-        # When vocab mapping is not provided, use the full verifier vocab
-        verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
-        if hasattr(verifier_config, "text_config"):
-            verifier_config = verifier_config.text_config
-        draft_vocab_size = verifier_config.vocab_size
+    d2t, t2d, draft_vocab_size = parse_vocab_mappings(args)
 
     # Setup speculator config
     transformer_layer_config = create_transformer_layer_config(
         args.verifier_name_or_path, args.num_layers, draft_arch=args.draft_arch
     )
-
-    # Get model class from registry and create model using its factory method
-    if SpeculatorModel.registry_auto_discovery:
-        SpeculatorModel.auto_populate_registry()
 
     if args.speculator_type not in SpeculatorModel.registry:
         raise ValueError(
@@ -188,31 +235,71 @@ def main(args: argparse.Namespace):
         )
 
     model_class = SpeculatorModel.registry[args.speculator_type]
-    draft_model = model_class.from_training_args(
-        verifier_config=transformer_layer_config,
-        t2d=t2d,
-        d2t=d2t,
-        draft_vocab_size=draft_vocab_size,
-        **vars(args),
-    )
+    if args.from_pretrained:
+        draft_model = model_class.from_pretrained(
+            args.from_pretrained, t2d=t2d, d2t=d2t
+        )
+    else:
+        args_dict = vars(args)
+        args_dict["draft_vocab_size"] = draft_vocab_size
+        draft_model = model_class.from_training_args(
+            verifier_config=transformer_layer_config,
+            t2d=t2d,
+            d2t=d2t,
+            **args_dict,
+        )
 
     # Setup dataloaders
-    train_files, val_files = split_files(args.data_path, ratio=0.9)
+    noise_transform = AddUniformNoise(std=args.noise_std)
+    if args.legacy_data:
+        warnings.warn(
+            "Using '--legacy-data' is deprecated and will be removed soon.",
+            category=DeprecationWarning,
+            stacklevel=2,
+        )
+        train_files, val_files = split_files(args.data_path, ratio=0.9)
+        train_dataset: BaseEagle3Dataset = Eagle3SampleFileDataset(
+            file_list=train_files, max_len=args.total_seq_len, transform=noise_transform
+        )
+        val_dataset: BaseEagle3Dataset = Eagle3SampleFileDataset(
+            file_list=val_files, max_len=args.total_seq_len
+        )
+    else:
+        train_dataset = Eagle3ArrowDataset(
+            datapath=args.data_path,
+            max_len=args.total_seq_len,
+            hidden_states_path=args.hidden_states_path,
+            vllm_endpoint=args.vllm_endpoint,
+            on_missing=args.on_missing,
+            on_generate=args.on_generate,
+            transform=noise_transform,
+            split_ratio=0.9,
+            model=args.verifier_name_or_path,
+        )
+        val_dataset = Eagle3ArrowDataset(
+            datapath=args.data_path,
+            max_len=args.total_seq_len,
+            hidden_states_path=args.hidden_states_path,
+            vllm_endpoint=args.vllm_endpoint,
+            on_missing=args.on_missing,
+            on_generate=args.on_generate,
+            split_ratio=-0.1,
+            model=args.verifier_name_or_path,
+        )
+
     train_loader = setup_dataloader(
-        train_files,
+        train_dataset,
         world_size,
-        local_rank,
-        add_noise=True,
-        noise_std=args.noise_std,
+        rank,
+        transformer_layer_config.hidden_size,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
     val_loader = setup_dataloader(
-        val_files,
+        val_dataset,
         world_size,
-        local_rank,
-        add_noise=False,
-        noise_std=args.noise_std,
+        rank,
+        transformer_layer_config.hidden_size,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
     )
@@ -233,6 +320,9 @@ def main(args: argparse.Namespace):
         scheduler_warmup_steps=args.scheduler_warmup_steps,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        checkpoint_freq=args.checkpoint_freq,
+        save_best=args.save_best,
+        hidden_states_dtype=hidden_states_dtype,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -241,6 +331,13 @@ def main(args: argparse.Namespace):
 
     # Cleanup
     maybe_destroy_distributed()
+
+
+def _checkpoint_freq(value: str) -> int:
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError("--checkpoint-freq must be >= 1")
+    return ivalue
 
 
 def parse_args():
@@ -283,7 +380,67 @@ def parse_args():
             "1: VwnEagle3PreVwnLayerV1 (ablation, simplified fusion)."
         ),
     )
+    parser.add_argument(
+        "--from-pretrained",
+        type=str,
+        default="",
+        help="The pretrained draft model to finetune",
+    )
     parser.add_argument("--data-path", type=str, default="./data")
+    parser.add_argument(
+        "--hidden-states-path",
+        type=str,
+        default=None,
+        help=(
+            "The path where cached hidden states files are stored. (Default: "
+            "args.data_path / 'hidden_states')"
+        ),
+    )
+    parser.add_argument(
+        "--vllm-endpoint",
+        type=str,
+        default="http://localhost:8000/v1",
+        help=(
+            "vLLM endpoint address to use if generating hidden states on-demand."
+            " Only required if `--on-missing=generate` and samples are missing."
+            " Note: the vLLM instance must be configured to cache hidden states"
+            " to a location that is accessible from the training instance. i.e."
+            " on the same node, or a shared network drive. (Default: 'http://localhost:8000/v1')"
+        ),
+    )
+    parser.add_argument(
+        "--on-missing",
+        choices=["generate", "skip", "warn", "raise"],
+        default="generate",
+        help=(
+            "Dataloader behaviour when there are no cached hidden states for a sample."
+            "Default: 'generate', which attempts to generate the hidden states on-"
+            "demand using the provided vLLM endpoint. The other options skip the sample"
+            ", skip and warn, or raise an error respectively."
+        ),
+    )
+    parser.add_argument(
+        "--on-generate",
+        choices=["cache", "delete"],
+        default="delete",
+        help=(
+            "Dataloader behaviour when a new hidden state has been generated"
+            " (only applies if args.on_missing=='generate'). Default: 'delete', "
+            "deletes hidden states once they are loaded. 'cache' will instead store"
+            "the hidden states in the args.hidden_states_path. This can be used to "
+            "enable hybrid online/offline training, with hidden states generated on the"
+            "first epoch, and reused on subsequent epochs."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-data",
+        action="store_true",
+        help=(
+            "DEPRECATED. Use the old data format which stores hidden states alongside "
+            "token_ids and assistant_masks, in data_i.pt files. This option will be "
+            "removed soon."
+        ),
+    )
     parser.add_argument("--save-path", type=str, default="./checkpoints")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -306,6 +463,19 @@ def parse_args():
         help="Architecture for draft decoder layers. Defaults to 'llama'. "
         "Note: only 'llama' is currently supported in vLLM for inference."
         "vwn_llama is also supported",
+    )
+
+    parser.add_argument(
+        "--token-freq-path",
+        type=str,
+        default=None,
+        help="Path to token frequency distribution file (.pt)",
+    )
+    parser.add_argument(
+        "--draft-vocab-size",
+        type=int,
+        default=None,
+        help="Vocabulary size for the draft model",
     )
     parser.add_argument("--d2t-path", type=str, default=None)
     parser.add_argument("--t2d-path", type=str, default=None)
@@ -338,6 +508,12 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
     parser.add_argument(
+        "--hidden-states-dtype",
+        type=str,
+        default="bfloat16",
+        help="The dtype to initialize model weights and dataloader hidden states to",
+    )
+    parser.add_argument(
         "--deterministic-cuda",
         action="store_true",
         default=False,
@@ -362,6 +538,12 @@ def parse_args():
         default=False,
         help="Whether to train embedding layer weights (default: False)",
     )
+    parser.add_argument(
+        "--norm-before-fc",
+        action="store_true",
+        help="Use RMSNorm before fc in Eagle3 draft path "
+        "(e.g. for gpt-oss). Omit for other models.",
+    )
     # Dataloader parameters
     parser.add_argument(
         "--num-workers", type=int, default=12, help="Number of dataloader workers"
@@ -375,6 +557,20 @@ def parse_args():
         default=0.05,
         help="Standard deviation for noise augmentation",
     )
+    # Checkpoint Parameters
+    parser.add_argument(
+        "--checkpoint-freq",
+        type=_checkpoint_freq,
+        default=1,
+        help="Save a checkpoint every N epochs.",
+    )
+    parser.add_argument(
+        "--save-best",
+        action="store_true",
+        default=False,
+        help="Pointing to checkpoint with lowest validation loss.",
+    )
+
     # lr scheduler
     parser.add_argument("--scheduler-type", type=str, default="linear")
     parser.add_argument("--scheduler-warmup-steps", type=int, default=None)
@@ -389,7 +585,7 @@ if __name__ == "__main__":
 
 
 # RUN WITH:
-# torchrun --nnodes=1 --nproc_per_node=<num_gpus>  scripts/train.py
+# torchrun --standalone --nproc_per_node=<num_gpus>  scripts/train.py
 # for FSDP training
 # OR
 # python scripts/train.py

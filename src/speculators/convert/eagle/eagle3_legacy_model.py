@@ -242,7 +242,7 @@ class Eagle3Speculator(SpeculatorModel):
     """
 
     config_class: ClassVar[type[Eagle3SpeculatorConfig]] = Eagle3SpeculatorConfig  # type: ignore[misc]
-    _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
+    _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[assignment,misc]
         "verifier*",
     ]
     _keys_to_ignore_on_save: ClassVar[list[str]] = []  # type: ignore[misc,assignment]
@@ -339,7 +339,7 @@ class Eagle3Speculator(SpeculatorModel):
             self.t2d: torch.Tensor
         self.post_init()  # type: ignore[attr-defined]
 
-    def tie_weights(self):
+    def tie_weights(self, *_args, **_kwargs):
         """
         Override tie_weights to prevent vocabulary corruption in transformers 4.54.1+
 

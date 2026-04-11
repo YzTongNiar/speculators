@@ -134,6 +134,7 @@ class TrainArgs(NamedTuple):
     scheduler_num_cosine_cycles: float | _NS = _NOTSET
     loss_type: str | _NS = _NOTSET
     eta: float | _NS = _NOTSET
+    norm_before_fc: bool | _NS = _NOTSET
 
 
 ### END OF SCRIPT ARGUMENTS ###
@@ -332,6 +333,7 @@ def run_e2e(
         ta_dict["t2d-path"] = str(output_path / "vocab_mapping" / "t2d.npy")
 
     ta_list = prepare_args(ta_dict)
+    ta_list.append("--legacy-data")
 
     # Get additional packages to install if loggers are specified.
     packages = ["."]

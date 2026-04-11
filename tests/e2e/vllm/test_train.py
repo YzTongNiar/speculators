@@ -54,7 +54,9 @@ class TestTrainvLLM:
         )
 
     @pytest.mark.smoke
-    def test_train_vllm_engine(self, tmp_path: Path, prompts: list[str]):
+    def test_train_vllm_engine(
+        self, tmp_path: Path, prompts: list[list[dict[str, str]]]
+    ):
         MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
         DATASET_PATH = "nm-testing/sharegpt_llama3_8b_hidden_states"
         TOKEN_FREQ_PATH = "nm-testing/sharegpt_llama3_8b_token_freq"
@@ -80,6 +82,7 @@ class TestTrainvLLM:
             "log-dir": str(tmp_path / "logs"),
             "d2t-path": str(tmp_path / "d2t.npy"),
             "t2d-path": str(tmp_path / "t2d.npy"),
+            "legacy-data": True,
         }
         # 3. Train draft model for one epoch
         p = self._run_training("scripts/train.py", training_args)

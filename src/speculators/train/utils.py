@@ -35,7 +35,7 @@ def maybe_setup_distributed() -> tuple[int, int, int, bool]:
     rank = dist.get_rank()
 
     logger.info(
-        f"Started distributed with local_rank={local_rank}, world_size={world_size}",
+        f"Started distributed with local_rank={local_rank}, world_size={world_size}, rank={rank}",
         extra={"override_rank0_filter": True},
     )
     return local_rank, world_size, rank, True
@@ -67,8 +67,6 @@ def apply_fully_sharded(model: torch.nn.Module):
     )
 
     for layer in model.layers:  # type: ignore[union-attr]
-        # we apply fully_shard to each DecoderLayer
-        layer.to_empty(device="meta")
         fully_shard(layer, mp_policy=mp_policy)
 
     fully_shard(model)
