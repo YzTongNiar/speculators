@@ -45,6 +45,7 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: int = 1
+    checkpoint_step_freq: int = 0
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
 
@@ -267,6 +268,32 @@ class Trainer:
                 extra={"step": self.global_step},
             )
             self.global_step += 1
+
+            if (
+                self.config.checkpoint_step_freq > 0
+                and self.global_step % self.config.checkpoint_step_freq == 0
+            ):
+                root_logger.info(
+                    f"Saving mid-epoch checkpoint at step {self.global_step} "
+                    f"(epoch {epoch})"
+                )
+                mid_epoch_tag = f"{epoch}_mid"
+                mid_path = self.checkpointer.path / mid_epoch_tag
+                if self.rank == 0 and mid_path.exists():
+                    import shutil
+                    shutil.rmtree(mid_path)
+                if self.is_distributed:
+                    dist.barrier()
+                self.checkpointer.save_checkpoint(
+                    self.model, self.opt, mid_epoch_tag
+                )
+                if self.scheduler is not None:
+                    self.checkpointer.save_scheduler_state_dict(
+                        self.scheduler, mid_epoch_tag
+                    )
+                root_logger.info(
+                    f"Mid-epoch checkpoint saved to {mid_path}"
+                )
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:

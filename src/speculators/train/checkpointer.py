@@ -68,7 +68,7 @@ class BaseCheckpointer:
         scheduler.load_state_dict(full_state_dict)
 
     def save_scheduler_state_dict(
-        self, scheduler: torch.optim.lr_scheduler.LRScheduler, epoch: int
+        self, scheduler: torch.optim.lr_scheduler.LRScheduler, epoch: int | str
     ):
         scheduler_path = self.scheduler_path(epoch)
         torch.save(scheduler.state_dict(), scheduler_path)
@@ -78,7 +78,7 @@ class BaseCheckpointer:
         self,
         model: PreTrainedModel,
         optimizer: torch.optim.Optimizer,
-        epoch: int,
+        epoch: int | str,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         raise NotImplementedError
@@ -95,15 +95,15 @@ class BaseCheckpointer:
                     continue
         return last_checkpoint_num
 
-    def model_path(self, epoch: int):
+    def model_path(self, epoch: int | str):
         model_fname = "model.safetensors"
         return self.path / str(epoch) / model_fname
 
-    def optimizer_path(self, epoch: int):
+    def optimizer_path(self, epoch: int | str):
         optimizer_fname = "optimizer_state_dict.pt"
         return self.path / str(epoch) / optimizer_fname
 
-    def scheduler_path(self, epoch: int):
+    def scheduler_path(self, epoch: int | str):
         scheduler_fname = "scheduler_state_dict.pt"
         return self.path / str(epoch) / scheduler_fname
 
@@ -230,7 +230,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         self,
         model: PreTrainedModel,
         optimizer: torch.optim.Optimizer,
-        epoch: int,
+        epoch: int | str,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         model_state_dict = convert_float_dtype(model.state_dict(), float_dtype)
@@ -288,7 +288,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         self,
         model: PreTrainedModel,
         optimizer: torch.optim.Optimizer,
-        epoch: int,
+        epoch: int | str,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         model_state_dict = get_model_state_dict(
@@ -323,7 +323,7 @@ class DistributedCheckpointer(BaseCheckpointer):
         dist.barrier()
 
     def save_scheduler_state_dict(
-        self, scheduler: torch.optim.lr_scheduler.LRScheduler, epoch: int
+        self, scheduler: torch.optim.lr_scheduler.LRScheduler, epoch: int | str
     ):
         if dist.get_rank() == 0:
             super().save_scheduler_state_dict(scheduler, epoch)

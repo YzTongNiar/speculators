@@ -321,6 +321,7 @@ def main(args: argparse.Namespace):
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
         checkpoint_freq=args.checkpoint_freq,
+        checkpoint_step_freq=args.checkpoint_step_freq,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
     )
@@ -569,6 +570,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Pointing to checkpoint with lowest validation loss.",
+    )
+    parser.add_argument(
+        "--checkpoint-step-freq",
+        type=int,
+        default=0,
+        help="Save a mid-epoch checkpoint every N steps (overwrites previous). 0 to disable.",
     )
 
     # lr scheduler
